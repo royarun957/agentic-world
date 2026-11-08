@@ -105,7 +105,6 @@ class StockPicker():
             agents=self.agents,
             tasks=self.tasks, 
             process=Process.hierarchical, # hierarchical process means the crew will first find the trending companies, then research them, and then pick the best company
-            verbose=True,
             memory=memory,
             tracing=True,
             manager_agent=manager,
