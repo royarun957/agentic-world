@@ -10,7 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from pydantic import BaseModel, field_validator
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-REPO_ROOT = PROJECT_DIR.parents[2]  # .../agents, where the shared .env lives
+REPO_ROOT = PROJECT_DIR.parent  # .../sre_monitor, where the shared .env lives
 load_dotenv(REPO_ROOT / ".env", override=True)
 load_dotenv(PROJECT_DIR / ".env", override=True)
 

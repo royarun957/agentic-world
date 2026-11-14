@@ -96,7 +96,7 @@ Each SEV1/SEV2 verification consumes two Serper searches; lower severities consu
 
 ## Run
 
-From `6_mcp/community_contributions/sre_monitor`, start the engine and dashboard in separate terminals:
+From `sre_monitor`, start the engine and dashboard in separate terminals:
 
 ```bash
 uv run -m backend.engine

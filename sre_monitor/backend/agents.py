@@ -20,6 +20,9 @@ from langgraph.types import Command
 from langsmith import traceable
 from pydantic import BaseModel, Field
 
+from deepeval.integrations.langchain import CallbackHandler
+from deepeval.tracing import update_current_trace
+
 from . import store
 from .emailer import PUSH_SEVERITIES, recipients, send_email, send_push
 from .email_templates import markdown_to_email_html, shell
@@ -36,6 +39,7 @@ from .prompts import (
     DAILY_REVIEW_EMAIL_NOTE,
 )
 
+
 REPORTS_DIR = PROJECT_DIR / "reports"
 MAX_ORCHESTRATOR_TURNS = 8
 SEVERITY_COLOURS = {"SEV1": "#c0392b", "SEV2": "#e67e22", "SEV3": "#f1c40f", "SEV4": "#7f8c8d"}
@@ -43,6 +47,8 @@ SEVERITY_COLOURS = {"SEV1": "#c0392b", "SEV2": "#e67e22", "SEV3": "#f1c40f", "SE
 NextStep = Literal[
     "status_watcher", "triage", "impact_verifier", "postmortem_analyst", "notifier", "finish"
 ]
+
+deepeval_callback = CallbackHandler()
 
 
 class MonitorState(TypedDict, total=False):
@@ -168,6 +174,11 @@ async def orchestrator(
 ) -> Command[
     Literal["status_watcher", "triage", "impact_verifier", "postmortem_analyst", "notifier", "__end__"]
 ]:
+    update_current_trace(
+        name=f"SRE Monitor - {state['mode'].replace('_', ' ').title()}",
+        tags=["sre-monitor", state["mode"]],
+        metadata={"mode": state["mode"], "dry_run": state.get("dry_run", False)},
+    )
     turns = state.get("turns", 0) + 1
     required = _required_next(state)
     if turns > MAX_ORCHESTRATOR_TURNS:
@@ -268,21 +279,30 @@ async def impact_verifier(state: MonitorState) -> Command[Literal["orchestrator"
     targets = [
         decision for decision in state["triage"] if decision["severity"] in settings.severities
     ]
-    searches = await asyncio.gather(
-        *(
-            search_incident_evidence(
-                candidates[decision["key"]]["service"],
-                candidates[decision["key"]]["title"],
-                settings.results_per_query,
-            )
-            for decision in targets
+    targets_by_key = {decision["key"]: decision for decision in targets}
+    evidence_by_key: dict[str, dict] = {}
+
+    @tool("search_incident_evidence")
+    async def search_incident_evidence_tool(key: str) -> str:
+        """Search Reddit and the web for current evidence about one target incident.
+
+        Args:
+            key: The exact incident key supplied in the verification request.
+        """
+        if key not in targets_by_key:
+            return json.dumps({"error": f"Unknown incident key: {key}"})
+        candidate = candidates[key]
+        evidence = await search_incident_evidence(
+            candidate["service"],
+            candidate["title"],
+            settings.results_per_query,
         )
-    )
+        evidence_by_key[key] = evidence
+        return json.dumps(evidence)
+
     payload = []
-    evidence_by_key = {}
-    for decision, evidence in zip(targets, searches):
+    for decision in targets:
         candidate = candidates[decision["key"]]
-        evidence_by_key[decision["key"]] = evidence
         payload.append(
             {
                 "key": decision["key"],
@@ -294,18 +314,24 @@ async def impact_verifier(state: MonitorState) -> Command[Literal["orchestrator"
                     "summary": reports[decision["key"]]["summary"],
                     "preliminary_triage": decision,
                 },
-                "search_evidence": evidence,
             }
         )
 
     try:
-        result = await get_llm().with_structured_output(ImpactReport).ainvoke(
-            [
-                SystemMessage(content=IMPACT_VERIFIER_PROMPT),
-                HumanMessage(content=json.dumps(payload, indent=1)),
-            ]
+        agent = create_agent(
+            model=get_llm(),
+            tools=[search_incident_evidence_tool],
+            system_prompt=IMPACT_VERIFIER_PROMPT,
+            response_format=ImpactReport,
         )
-        by_key = {decision.key: decision.model_dump() for decision in result.decisions}
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=json.dumps(payload, indent=1))]},
+            config={"recursion_limit": 4 * len(targets) + 10},
+        )
+        structured = result["structured_response"]
+        by_key = {
+            decision.key: decision.model_dump() for decision in structured.decisions
+        }
     except Exception as exc:
         by_key = {}
         store.log("Impact Verifier", "error", f"LLM judge unavailable: {type(exc).__name__}: {exc}")
@@ -314,7 +340,13 @@ async def impact_verifier(state: MonitorState) -> Command[Literal["orchestrator"
     updated_triage = [dict(decision) for decision in state["triage"]]
     triage_by_key = {decision["key"]: decision for decision in updated_triage}
     for target in targets:
-        evidence = evidence_by_key[target["key"]]
+        evidence = evidence_by_key.get(
+            target["key"],
+            {
+                "results": [],
+                "errors": ["Impact Verifier did not request independent evidence."],
+            },
+        )
         allowed_urls = {
             item["link"] for item in evidence["results"] if item.get("link")
         }
@@ -570,6 +602,56 @@ def read_incident_page(url: str) -> str:
     return read_page_text(url)
 
 
+@tool
+def query_incident_history(
+    hours: int = 168,
+    service: str = "",
+    limit: int = 20,
+) -> str:
+    """Read recent incidents from the local SQLite history without modifying it.
+
+    Args:
+        hours: Lookback window in hours, from 1 to 720.
+        service: Optional exact service name to filter by.
+        limit: Maximum number of incidents to return, from 1 to 50.
+    """
+    hours = max(1, min(hours, 720))
+    limit = max(1, min(limit, 50))
+    incidents = store.incidents_since(hours)
+    if service:
+        incidents = [
+            incident
+            for incident in incidents
+            if incident["service"].casefold() == service.casefold()
+        ]
+    fields = (
+        "service",
+        "name",
+        "status",
+        "impact",
+        "severity",
+        "global_impact",
+        "priority",
+        "created_at",
+        "resolved_at",
+        "summary",
+        "link",
+    )
+    history = [
+        {field: incident.get(field) for field in fields}
+        for incident in incidents[:limit]
+    ]
+    return json.dumps(
+        {
+            "hours": hours,
+            "service": service or None,
+            "count": len(history),
+            "incidents": history,
+        },
+        default=str,
+    )
+
+
 async def postmortem_analyst(state: MonitorState) -> Command[Literal["orchestrator"]]:
     settings = get_settings()
     hours = settings.monitor.lookback_hours
@@ -596,7 +678,11 @@ async def postmortem_analyst(state: MonitorState) -> Command[Literal["orchestrat
             }
             for incident in selected
         ]
-        agent = create_agent(model=get_llm(), tools=[read_incident_page], system_prompt=POSTMORTEM_PROMPT)
+        agent = create_agent(
+            model=get_llm(),
+            tools=[read_incident_page, query_incident_history],
+            system_prompt=POSTMORTEM_PROMPT,
+        )
         result = await agent.ainvoke(
             {"messages": [HumanMessage(content=json.dumps(payload, indent=1))]},
             config={"recursion_limit": 4 * len(selected) + 20},
@@ -643,11 +729,11 @@ team = build_graph()
 async def run_incident_alert(candidates: list[dict], dry_run: bool = False) -> MonitorState:
     store.log("Orchestrator", "trace", f"Incident alert started for {len(candidates)} new or escalated entries")
     return await team.ainvoke(
-        {"mode": "incident_alert", "dry_run": dry_run, "candidates": candidates}, config={"recursion_limit": 30}
+        {"mode": "incident_alert", "dry_run": dry_run, "candidates": candidates}, config={"recursion_limit": 30, "callbacks": [deepeval_callback]}
     )
 
 
 @traceable(name="SRE Monitor - Daily Review", run_type="chain")
 async def run_daily_review(dry_run: bool = False) -> MonitorState:
     store.log("Orchestrator", "trace", "Daily postmortem review started")
-    return await team.ainvoke({"mode": "daily_review", "dry_run": dry_run}, config={"recursion_limit": 30})
+    return await team.ainvoke({"mode": "daily_review", "dry_run": dry_run}, config={"recursion_limit": 30, "callbacks": [deepeval_callback]})
